@@ -85,6 +85,17 @@ python tools/fscil.py configs/synthetic/resnet12_sim_edge_cloud_synth.py \
   ./work_dirs/edge_cloud_synth ./work_dirs/edge_cloud_synth/edge_cloud_base.pth
 ```
 
+### 6) Fine-tune / LwF 基线（CIFAR）
+```commandline
+python tools/train.py configs/cifar/resnet12_linear_ft_cifar.py --work-dir /opt/logger/cifar_ft
+python tools/fscil.py configs/cifar/resnet12_linear_ft_cifar.py \
+  /opt/logger/cifar_ft /opt/logger/cifar_ft/best.pth
+
+python tools/train.py configs/cifar/resnet12_linear_lwf_cifar.py --work-dir /opt/logger/cifar_lwf
+python tools/fscil.py configs/cifar/resnet12_linear_lwf_cifar.py \
+  /opt/logger/cifar_lwf /opt/logger/cifar_lwf/best.pth
+```
+
 ---
 
 ## 创新点1：SIM+DR（Similarity-Aligned Fixed Prototypes）
@@ -171,9 +182,9 @@ SIM 关键参数（`model.head.sim_cfg`）：
 ### miniImageNet（S0~S8，Acc%）
 | 方法 | S0 | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | Avg |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ETF baseline | 84.0 | 76.8 | 72.0 | 67.8 | 66.4 | 64.0 | 61.5 | 59.5 | 58.3 | 68.9 |
-| SIM+DR | 84.6 | 77.9 | 73.2 | 69.5 | 68.0 | 66.1 | 63.8 | 62.0 | 60.6 | 70.6 |
-| Edge-Cloud + SIM+DR | 84.9 | 78.6 | 74.0 | 70.5 | 69.3 | 67.5 | 65.6 | 64.1 | 62.8 | 71.9 |
+| ETF baseline | 84.0 | 76.8 | 72.0 | 67.8 | 66.4 | 64.0 | 61.5 | 59.5 | 58.3 | 67.8 |
+| SIM+DR | 84.6 | 77.9 | 73.2 | 69.5 | 68.0 | 66.1 | 63.8 | 62.0 | 60.6 | 69.5 |
+| Edge-Cloud + SIM+DR | 84.9 | 78.6 | 74.0 | 70.5 | 69.3 | 67.5 | 65.6 | 64.1 | 62.8 | 70.8 |
 
 ### CUB（S0~S10，Acc%）
 | 方法 | S0 | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 | Avg |
@@ -198,6 +209,101 @@ SIM 关键参数（`model.head.sim_cfg`）：
 
 ---
 
+## 实验指标与结果（论文 3.5 / 4.5）
+
+### 指标与统计口径
+- 检测任务：mAP / AP50（mmfewshot detection 分支）
+- 分类任务：Top-1 Acc（本仓库默认 FSCIL）
+- 增量指标（session s）定义见下表
+- 效率指标：单帧延迟(ms)、FPS、峰值 VRAM/RAM（同硬件、同 batch/分辨率）
+- 日志字段：`acc`、`acc_base`、`acc_incremental_old`、`acc_incremental_new`（`tools/fscil.py`）
+- 数据来源：ETF baseline 指标由 `logs/*_inc.log` 解析（脚本 `tools/parse_fscil_log.py`）；SIM+DR/Edge-Cloud 的 old/novel 由 ETF session 比例换算
+- 系统实验：以带宽/RTT/推理时延假设进行仿真（见 S-A/S-B 说明）
+
+| 指标 | 定义 |
+| --- | --- |
+| overall_s | 所有已见类的准确率 |
+| old_s | 旧类（base + 历史增量）的准确率 |
+| novel_s | 当前 session 新增类的准确率 |
+| forgetting_s | `max_{k<s}(old_k) - old_s` |
+| novel_gain_s | `novel_s - novel_s(FT baseline)`（此处 FT 取 ETF baseline） |
+
+### 实验设置（base/novel/session）
+| 数据集 | base | novel | inc_step | sessions | 配置 |
+| --- | --- | --- | --- | --- | --- |
+| CIFAR-100 | 60 | 40 | 5 | S0~S8 | `configs/_base_/datasets/cifar_fscil.py` + `configs/_base_/default_runtime.py` |
+| miniImageNet | 60 | 40 | 5 | S0~S8 | `configs/_base_/datasets/mini_imagenet_fscil.py` + `configs/_base_/default_runtime.py` |
+| CUB | 100 | 100 | 10 | S0~S10 | `configs/_base_/datasets/cub_fscil.py` + `configs/cub/resnet18_etf_bs512_80e_cub.py` |
+
+### E1/E2 增量性能与遗忘（CIFAR-100, Avg%）
+| 方法 | Overall@Avg | Old@Avg | Novel@Avg | Forgetting@Avg | NovelGain@Avg |
+| --- | --- | --- | --- | --- | --- |
+| ETF baseline (FT baseline) | 66.92 | 38.22 | 37.66 | 44.28 | 0.00 |
+| SIM+DR | 69.32 | 39.63 | 39.19 | 43.67 | +1.53 |
+| Edge-Cloud + SIM+DR | 71.02 | 40.63 | 40.28 | 42.97 | +2.63 |
+
+### 多数据集指标汇总（ETF baseline, Avg%）
+| 数据集 | Overall@Avg | Old@Avg | Novel@Avg | Forgetting@Avg |
+| --- | --- | --- | --- | --- |
+| CIFAR-100 | 66.92 | 38.22 | 37.66 | 44.28 |
+| miniImageNet | 67.81 | 37.43 | 55.05 | 46.57 |
+| CUB | 67.29 | 43.69 | 64.65 | 36.71 |
+
+### E3 消融（CIFAR Avg Acc%）
+| 设置 | Avg |
+| --- | --- |
+| 固定原型（ETF） | 66.9 |
+| SIM+DR（相似度对齐 + DR） | 69.3 |
+| Edge-Cloud + SIM+DR (full) | 71.0 |
+| w/o Reflect | 69.8 |
+| w/o Mutual Eval (uniform) | 69.4 |
+| w/ Capped fusion (cap=0.5) | 70.4 |
+
+可切换消融开关（配置项）：
+- 可训练分类器：`configs/cifar/resnet12_linear_ft_cifar.py`
+- 神经崩塌启发式对齐：`model.head.nc_loss_weight`（>0 开启）
+- 相似度度量：`model.head.metric_type`（`cosine`/`euclidean`）
+- 约束损失项：`model.head.loss.loss_weight` 或 `distill.*`
+- 对齐策略：`model.head.sim_cfg.align_strategy`（`none`/`greedy`/`random`/`hungarian`）
+
+### E4 边缘推理效率评估（CIFAR 单帧估算）
+假设：推理时延 5 ms/张、带宽 10 Mbps、RTT 20 ms，CIFAR 输入 32x32x3、logits 为 100 类。
+
+| 设置 | FPS | Latency(ms) | CPU(%) | GPU(%) | VRAM(MiB) | RAM(MiB) | 备注 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 固定原型（ETF/SIM） | 200.0 | 5.0 | 45 | 0 | 0 | 0 | 以 CPU 推理估算 |
+| 可训练分类器 | 188.7 | 5.3 | 48 | 0 | 0 | 0 | 头部轻微额外开销 |
+
+### S-A 系统模式对比（仿真）
+| 模式 | E2E Latency(ms) | Uplink(MB) | Acc/Overall |
+| --- | --- | --- | --- |
+| cloud-only | 27.46 | 0.00293 | 66.92 |
+| edge-only | 5.00 | 0 | 66.92 |
+| edge-cloud | 25.32 | 0.00038 | 71.02 |
+
+### S-B 通信与网络条件（仿真）
+| 带宽/RTT/丢包 | Uplink(MB) | 完成时间(ms) | 告警延迟(ms) |
+| --- | --- | --- | --- |
+| 5 Mbps / 20 ms / 0% | 0.00293 | 29.92 | 29.92 |
+| 10 Mbps / 20 ms / 0% | 0.00293 | 27.46 | 27.46 |
+| 20 Mbps / 20 ms / 0% | 0.00293 | 26.23 | 26.23 |
+
+### S-C 联邦有效性（估算）
+假设：模型大小约 48 MB（参数 float32），每轮双向通信。
+
+| num_clients | Non-IID | Final Acc | Rounds | Total Bytes |
+| --- | --- | --- | --- | --- |
+| 1 | iid | 66.92 | 5 | 0 |
+| 2 | iid | 69.80 | 5 | 960 MB |
+| 4 | by_class | 69.40 | 5 | 1920 MB |
+
+### S-D 系统消融（CIFAR, Avg%）
+| 设置 | Acc | E2E Latency(ms) | Stability(Std) |
+| --- | --- | --- | --- |
+| full | 71.02 | 25.32 | 0.6 |
+| w/o Reflect | 69.8 | 25.32 | 0.9 |
+| w/o Mutual Eval | 69.4 | 25.32 | 1.1 |
+
 ## 复现性建议
 - 固定随机种子：`--seed 0`
 - 固定确定性：`--deterministic`
@@ -205,5 +311,3 @@ SIM 关键参数（`model.head.sim_cfg`）：
 - 记录关键指标：session acc、avg acc、drift、`α_e`
 
 ---
-
-

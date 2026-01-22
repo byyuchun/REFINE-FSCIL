@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 
 import torch
@@ -11,6 +12,7 @@ from mmfscil.apis.fscil import (
     get_inc_memory,
     test_session,
     test_session_feat,
+    _summarize_sessions,
 )
 from mmfscil.datasets import MemoryDataset
 
@@ -91,8 +93,13 @@ def edge_cloud_fscil(model,
             param.requires_grad = False
 
     acc_list = []
-    acc = test_session(cfg, model_finetune, distributed, test_feat, test_label, logger, 1, 0, inc_start, inc_start)
-    acc_list.append(acc)
+    session_stats = []
+    stats = test_session(
+        cfg, model_finetune, distributed, test_feat, test_label,
+        logger, 1, 0, inc_start, inc_start,
+        inc_step=cfg.inc_step, return_details=True)
+    acc_list.append(stats['acc'])
+    session_stats.append(stats)
     logger.info('[EdgeCloud] Start incremental sessions.')
     save_checkpoint(model_finetune, os.path.join(cfg.work_dir, 'session_0.pth'))
 
@@ -163,15 +170,25 @@ def edge_cloud_fscil(model,
                 for idx in range(0, label_end):
                     cls_feat.append(cur_session_feats[cur_session_labels == idx].mean(dim=0, keepdim=True))
                 cls_feat = torch.cat(cls_feat)
-                acc = test_session_feat(cfg, model_finetune, distributed, test_feat, test_label,
-                                        cls_feat, logger, i + 2, 0, label_end, inc_start)
+                stats = test_session_feat(cfg, model_finetune, distributed, test_feat, test_label,
+                                          cls_feat, logger, i + 2, 0, label_end, inc_start,
+                                          inc_step=cfg.inc_step, return_details=True)
             else:
-                acc = test_session(cfg, model_finetune, distributed, test_feat, test_label,
-                                   logger, i + 2, 0, label_end, inc_start)
-            acc_list.append(acc)
+                stats = test_session(cfg, model_finetune, distributed, test_feat, test_label,
+                                     logger, i + 2, 0, label_end, inc_start,
+                                     inc_step=cfg.inc_step, return_details=True)
+            acc_list.append(stats['acc'])
+            session_stats.append(stats)
             save_checkpoint(model_finetune, os.path.join(cfg.work_dir, 'session_{}.pth'.format(i + 1)))
 
     acc_str = ''
     for acc in acc_list:
         acc_str += '{:.2f} '.format(acc)
     logger.info(acc_str)
+    summary = _summarize_sessions(session_stats)
+    metrics = dict(sessions=session_stats, summary=summary)
+    if cfg.work_dir:
+        metrics_path = os.path.join(cfg.work_dir, 'metrics.json')
+        with open(metrics_path, 'w', encoding='utf-8') as handle:
+            json.dump(metrics, handle, indent=2, ensure_ascii=True)
+        logger.info('[EdgeCloud] Saved FSCIL metrics to {}'.format(metrics_path))

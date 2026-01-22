@@ -12,6 +12,8 @@ SIM_CFG = dict(
     eig_tol=1e-6,
     hungarian=False,
     hungarian_max_classes=200,
+    align_strategy=None,  # none/hungarian/greedy/random
+    align_seed=0,
     fallback_steps=100,
     fallback_lr=0.1,
 )

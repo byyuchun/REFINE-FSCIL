@@ -52,6 +52,15 @@ edge_cloud = dict(
     seed=0,
 )
 
+# Distillation/regularization for incremental sessions
+distill = dict(
+    enabled=False,
+    type='lwf',  # lwf or l2
+    temperature=2.0,
+    lambda_kd=1.0,
+    lambda_l2=1.0,
+)
+
 # Test configs
 mean_neck_feat = True
 mean_cur_feat = False

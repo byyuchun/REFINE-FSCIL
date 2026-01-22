@@ -1,10 +1,12 @@
 import copy
+import json
 from collections import OrderedDict
 
 import mmcv
 import os
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad
 
 from mmcls.core import CosineAnnealingCooldownLrUpdaterHook
@@ -38,6 +40,51 @@ class Runner:
             raise RuntimeError(
                 'lr is not applicable because optimizer does not exist.')
         return lr
+
+
+def _safe_mean(tensor, default=0.0):
+    if tensor.numel() == 0:
+        return float(default)
+    return float(torch.mean(tensor).item() * 100.0)
+
+
+def _get_module(model):
+    return model.module if hasattr(model, 'module') else model
+
+
+def _compute_logits(model, feats):
+    module = _get_module(model)
+    device = next(module.parameters()).device
+    feats = feats.to(device)
+    if hasattr(module, 'neck') and module.with_neck:
+        feats = module.neck(feats)
+    if hasattr(module.head, 'pre_logits'):
+        feats = module.head.pre_logits(feats)
+    return module.head.simple_test(feats, softmax=False, post_process=False)
+
+
+def _summarize_sessions(session_stats):
+    overall = [s['acc'] for s in session_stats]
+    old = [s['acc_old'] for s in session_stats]
+    novel = [s['acc_new'] for s in session_stats]
+    forgetting = []
+    for idx, value in enumerate(old):
+        if idx == 0:
+            forgetting.append(0.0)
+        else:
+            forgetting.append(max(old[:idx]) - value)
+    def _avg(values, start=0):
+        vals = values[start:]
+        if not vals:
+            return 0.0
+        return float(sum(vals) / len(vals))
+    return dict(
+        overall_avg=_avg(overall, 0),
+        old_avg=_avg(old, 1),
+        novel_avg=_avg(novel, 1),
+        forgetting_avg=_avg(forgetting, 1),
+        forgetting=forgetting,
+    )
 
 
 def get_test_loader_cfg(cfg, is_distributed):
@@ -270,7 +317,8 @@ def get_inc_memory(cfg, model, logger, distributed, inc_start, inc_end):
 
 
 def test_session(cfg, model, distributed, test_feat: torch.Tensor, test_label: torch.Tensor,
-                 logger, session_idx: int, inc_start: int, inc_end: int, base_num: int):
+                 logger, session_idx: int, inc_start: int, inc_end: int, base_num: int,
+                 inc_step: int = None, return_details: bool = False):
     rank, world_size = get_dist_info()
     model.eval()
     logger.info("Evaluating session {}, from {} to {}.".format(session_idx, inc_start, inc_end))
@@ -328,24 +376,40 @@ def test_session(cfg, model, distributed, test_feat: torch.Tensor, test_label: t
     assert len(results) == len(labels)
     results = torch.tensor(results)
     labels = torch.tensor(labels)
-    acc = torch.mean(results).item() * 100.
-    acc_b = torch.mean(results[labels < base_num]).item() * 100.
-    acc_i = torch.mean(results[labels >= base_num]).item() * 100.
-    acc_i_new = torch.mean(results[labels >= inc_end - 5]).item() * 100.
-    acc_i_old = torch.mean(
-        results[torch.logical_and(torch.less(labels, inc_end - 5), torch.ge(labels, base_num))]
-    ).item() * 100.
+    acc = _safe_mean(results)
+    acc_b = _safe_mean(results[labels < base_num])
+    acc_i = _safe_mean(results[labels >= base_num])
+    inc_step = int(cfg.inc_step) if inc_step is None else int(inc_step)
+    if inc_end <= base_num:
+        acc_i_new = acc
+        acc_i_old = acc
+    else:
+        new_start = max(base_num, inc_end - inc_step)
+        new_mask = torch.logical_and(torch.ge(labels, new_start), torch.less(labels, inc_end))
+        old_mask = torch.less(labels, new_start)
+        acc_i_new = _safe_mean(results[new_mask])
+        acc_i_old = _safe_mean(results[old_mask])
     logger.info("[{:02d}]Evaluation results : acc : {:.2f} ; acc_base : {:.2f} ; acc_inc : {:.2f}".format(
         session_idx, acc, acc_b, acc_i))
     logger.info("[{:02d}]Evaluation results : acc_incremental_old : {:.2f} ; acc_incremental_new : {:.2f}".format(
         session_idx, acc_i_old, acc_i_new
     ))
+    if return_details:
+        return dict(
+            session=session_idx,
+            acc=acc,
+            acc_base=acc_b,
+            acc_inc=acc_i,
+            acc_old=acc_i_old,
+            acc_new=acc_i_new,
+        )
     return acc
 
 
 def test_session_feat(cfg, model, distributed, test_feat: torch.Tensor, test_label: torch.Tensor,
                       cls_feat: torch.Tensor,  # For feat compare
-                      logger, session_idx: int, inc_start: int, inc_end: int, base_num: int):
+                      logger, session_idx: int, inc_start: int, inc_end: int, base_num: int,
+                      inc_step: int = None, return_details: bool = False):
     logger.info("[Feat Evaluator] Extracting cls feat".format(session_idx, inc_start, inc_end))
     with torch.no_grad():
         cls_feat_after_neck = model(return_loss=False, return_feat=True, img=cls_feat, gt_label=None)
@@ -417,18 +481,33 @@ def test_session_feat(cfg, model, distributed, test_feat: torch.Tensor, test_lab
     assert len(results) == len(labels)
     results = torch.tensor(results)
     labels = torch.tensor(labels)
-    acc = torch.mean(results).item() * 100.
-    acc_b = torch.mean(results[labels < base_num]).item() * 100.
-    acc_i = torch.mean(results[labels >= base_num]).item() * 100.
-    acc_i_new = torch.mean(results[labels >= inc_end - 5]).item() * 100.
-    acc_i_old = torch.mean(
-        results[torch.logical_and(torch.less(labels, inc_end - 5), torch.ge(labels, base_num))]
-    ).item() * 100.
+    acc = _safe_mean(results)
+    acc_b = _safe_mean(results[labels < base_num])
+    acc_i = _safe_mean(results[labels >= base_num])
+    inc_step = int(cfg.inc_step) if inc_step is None else int(inc_step)
+    if inc_end <= base_num:
+        acc_i_new = acc
+        acc_i_old = acc
+    else:
+        new_start = max(base_num, inc_end - inc_step)
+        new_mask = torch.logical_and(torch.ge(labels, new_start), torch.less(labels, inc_end))
+        old_mask = torch.less(labels, new_start)
+        acc_i_new = _safe_mean(results[new_mask])
+        acc_i_old = _safe_mean(results[old_mask])
     logger.info("[{:02d}]Evaluation results : acc : {:.2f} ; acc_base : {:.2f} ; acc_inc : {:.2f}".format(
         session_idx, acc, acc_b, acc_i))
     logger.info("[{:02d}]Evaluation results : acc_incremental_old : {:.2f} ; acc_incremental_new : {:.2f}".format(
         session_idx, acc_i_old, acc_i_new
     ))
+    if return_details:
+        return dict(
+            session=session_idx,
+            acc=acc,
+            acc_base=acc_b,
+            acc_inc=acc_i,
+            acc_old=acc_i_old,
+            acc_new=acc_i_new,
+        )
     return acc
 
 
@@ -444,6 +523,12 @@ def fscil(
     inc_end = cfg.inc_end
     inc_step = cfg.inc_step
     logger = get_root_logger()
+    distill_cfg = cfg.get('distill', {})
+    distill_enabled = bool(distill_cfg.get('enabled', False))
+    distill_type = str(distill_cfg.get('type', 'lwf')).lower()
+    distill_temp = float(distill_cfg.get('temperature', 2.0))
+    distill_lambda_kd = float(distill_cfg.get('lambda_kd', 1.0))
+    distill_lambda_l2 = float(distill_cfg.get('lambda_l2', 1.0))
     rank, world_size = get_dist_info()
     # put inference model on gpus
     if distributed:
@@ -480,11 +565,17 @@ def fscil(
     else:
         model_finetune = wrap_non_distributed_model(
             model_finetune, cfg.device, device_ids=cfg.gpu_ids)
+    device = next(_get_module(model_finetune).parameters()).device
 
     # acc list for print
     acc_list = []
-    acc = test_session(cfg, model_finetune, distributed, test_feat, test_label, logger, 1, 0, inc_start, inc_start)
-    acc_list.append(acc)
+    session_stats = []
+    stats = test_session(
+        cfg, model_finetune, distributed, test_feat, test_label,
+        logger, 1, 0, inc_start, inc_start,
+        inc_step=inc_step, return_details=True)
+    acc_list.append(stats['acc'])
+    session_stats.append(stats)
     logger.info("Start to execute the incremental sessions.")
     # model_finetune.module.head.etf_rect[:, :inc_start] = 1.
     save_checkpoint(model_finetune, os.path.join(cfg.work_dir, 'session_{}.pth'.format(0)))
@@ -506,6 +597,12 @@ def fscil(
         num_steps = cfg.step_list[i]
         logger.info("{} steps".format(num_steps))
         if num_steps > 0:
+            teacher = None
+            if distill_enabled and label_start > inc_start:
+                teacher = copy.deepcopy(_get_module(model_finetune)).to(device)
+                teacher.eval()
+                for param in teacher.parameters():
+                    param.requires_grad = False
             if cfg.mean_cur_feat:
                 logger.info("Extracting all mean neck feats from {} to {}".format(inc_start, label_end))
                 logger.info("Copy {} duplications.".format(cfg.copy_list[i]))
@@ -596,7 +693,28 @@ def fscil(
                     data = next(cur_session_loader_iter)
                 optimizer.zero_grad()
                 losses = model_finetune(return_loss=True, img=data['feat'], gt_label=data['gt_label'])
-                losses['loss'].backward()
+                loss = losses['loss']
+                if teacher is not None and label_start > 0:
+                    if distill_type == 'lwf':
+                        with torch.no_grad():
+                            teacher_logits = _compute_logits(teacher, data['feat'])[:, :label_start]
+                        student_logits = _compute_logits(model_finetune, data['feat'])[:, :label_start]
+                        kd_loss = F.kl_div(
+                            F.log_softmax(student_logits / distill_temp, dim=1),
+                            F.softmax(teacher_logits / distill_temp, dim=1),
+                            reduction='batchmean') * (distill_temp ** 2)
+                        loss = loss + distill_lambda_kd * kd_loss
+                        losses['loss_kd'] = kd_loss * distill_lambda_kd
+                    elif distill_type == 'l2':
+                        student_head = _get_module(model_finetune).head
+                        teacher_head = teacher.head
+                        if hasattr(student_head, 'fc') and hasattr(teacher_head, 'fc'):
+                            cur_w = student_head.fc.weight[:label_start]
+                            old_w = teacher_head.fc.weight[:label_start]
+                            l2_loss = F.mse_loss(cur_w, old_w)
+                            loss = loss + distill_lambda_l2 * l2_loss
+                            losses['loss_l2'] = l2_loss * distill_lambda_l2
+                loss.backward()
                 if cfg.grad_clip:
                     params = model_finetune.module.parameters()
                     params = list(
@@ -619,15 +737,25 @@ def fscil(
                 for idx in range(0, label_end):
                     cls_feat.append(cur_session_feats[cur_session_labels == idx].mean(dim=0, keepdim=True))
                 cls_feat = torch.cat(cls_feat)
-                acc = test_session_feat(cfg, model_finetune, distributed, test_feat, test_label,
-                                        cls_feat,
-                                        logger, i + 2, 0, label_end, inc_start)
+                stats = test_session_feat(cfg, model_finetune, distributed, test_feat, test_label,
+                                          cls_feat,
+                                          logger, i + 2, 0, label_end, inc_start,
+                                          inc_step=inc_step, return_details=True)
             else:
-                acc = test_session(cfg, model_finetune, distributed, test_feat, test_label,
-                                   logger, i + 2, 0, label_end, inc_start)
-        acc_list.append(acc)
+                stats = test_session(cfg, model_finetune, distributed, test_feat, test_label,
+                                     logger, i + 2, 0, label_end, inc_start,
+                                     inc_step=inc_step, return_details=True)
+        acc_list.append(stats['acc'])
+        session_stats.append(stats)
         save_checkpoint(model_finetune, os.path.join(cfg.work_dir, 'session_{}.pth'.format(i + 1)))
     acc_str = ""
     for acc in acc_list:
         acc_str += "{:.2f} ".format(acc)
     logger.info(acc_str)
+    summary = _summarize_sessions(session_stats)
+    metrics = dict(sessions=session_stats, summary=summary)
+    if cfg.work_dir:
+        metrics_path = os.path.join(cfg.work_dir, 'metrics.json')
+        with open(metrics_path, 'w', encoding='utf-8') as handle:
+            json.dump(metrics, handle, indent=2, ensure_ascii=True)
+        logger.info("Saved FSCIL metrics to {}".format(metrics_path))

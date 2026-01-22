@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from mmcv.runner import get_dist_info
 from mmcls.utils import get_root_logger
@@ -78,6 +79,11 @@ class ETFHead(ClsHead):
         if self.proto_mode not in ['ETF', 'SIM']:
             raise ValueError(f'proto_mode={self.proto_mode} is not supported')
         self.sim_cfg = sim_cfg if sim_cfg is not None else {}
+        metric_type = kwargs.pop('metric_type', 'cosine')
+        self.metric_type = str(metric_type).lower()
+        if self.metric_type not in ['cosine', 'euclidean']:
+            raise ValueError(f'metric_type={self.metric_type} is not supported')
+        self.nc_loss_weight = float(kwargs.pop('nc_loss_weight', 0.0))
 
         if kwargs.get('eval_classes', None):
             self.eval_classes = kwargs.pop('eval_classes')
@@ -99,6 +105,8 @@ class ETFHead(ClsHead):
         logger.info("ETF head : evaluating {} out of {} classes.".format(self.eval_classes, self.num_classes))
         logger.info("ETF head : with_len : {}".format(self.with_len))
         logger.info("Proto mode : {}".format(self.proto_mode))
+        logger.info("Metric type : {}".format(self.metric_type))
+        logger.info("NC align weight : {:.4f}".format(self.nc_loss_weight))
 
         # ETF: maximal angular separation with a uniform simplex structure.
         # SIM: encode inter-class relations from a semantic similarity matrix
@@ -119,6 +127,39 @@ class ETFHead(ClsHead):
         x = x / torch.norm(x, p=2, dim=1, keepdim=True)
         return x
 
+    def _compute_logits(self, x, normalized=False):
+        if not normalized:
+            x = self.pre_logits(x)
+        if self.metric_type == 'cosine':
+            return x @ self.etf_vec
+        proto = self.etf_vec.t()
+        x2 = torch.sum(x * x, dim=1, keepdim=True)
+        p2 = torch.sum(proto * proto, dim=1, keepdim=True).t()
+        dist = x2 + p2 - 2.0 * (x @ proto.t())
+        return -dist
+
+    def _compute_nc_loss(self, x, gt_label):
+        if self.nc_loss_weight <= 0:
+            return None
+        labels = gt_label.view(-1)
+        uniq = torch.unique(labels)
+        means = []
+        protos = []
+        for cls in uniq.tolist():
+            mask = labels == cls
+            if not torch.any(mask):
+                continue
+            means.append(x[mask].mean(dim=0))
+            protos.append(self.etf_vec[:, int(cls)])
+        if not means:
+            return None
+        means = torch.stack(means, dim=0)
+        protos = torch.stack(protos, dim=0)
+        means = F.normalize(means, dim=1)
+        protos = F.normalize(protos, dim=1)
+        cos = torch.sum(means * protos, dim=1)
+        return (1.0 - cos).mean()
+
     def forward_train(self, x: torch.Tensor, gt_label: torch.Tensor, **kwargs) -> Dict:
         """Forward training data."""
         self._maybe_sync_proto()
@@ -131,19 +172,23 @@ class ETFHead(ClsHead):
         losses = self.loss(x, target)
         if self.cal_acc:
             with torch.no_grad():
-                cls_score = x @ self.etf_vec
+                cls_score = self._compute_logits(x, normalized=True)
                 acc = self.compute_accuracy(cls_score[:, :self.eval_classes], gt_label)
                 assert len(acc) == len(self.topk)
                 losses['accuracy'] = {
                     f'top-{k}': a
                     for k, a in zip(self.topk, acc)
                 }
+        nc_loss = self._compute_nc_loss(x, gt_label)
+        if nc_loss is not None:
+            losses['loss_nc'] = nc_loss * self.nc_loss_weight
+            losses['loss'] = losses['loss'] + losses['loss_nc']
         return losses
 
     def mixup_extra_training(self, x: torch.Tensor) -> Dict:
         self._maybe_sync_proto()
         x = self.pre_logits(x)
-        cls_score = x @ self.etf_vec
+        cls_score = self._compute_logits(x, normalized=True)
         assigned = torch.argmax(cls_score[:, self.eval_classes:], dim=1)
         target = self.etf_vec[:, assigned + self.eval_classes].t()
         losses = self.loss(x, target)
@@ -161,8 +206,7 @@ class ETFHead(ClsHead):
 
     def simple_test(self, x, softmax=False, post_process=False):
         self._maybe_sync_proto()
-        x = self.pre_logits(x)
-        cls_score = x @ self.etf_vec
+        cls_score = self._compute_logits(x, normalized=False)
         cls_score = cls_score[:, :self.eval_classes]
         assert not softmax
         if post_process:
@@ -229,6 +273,8 @@ class ETFHead(ClsHead):
             eig_tol=1e-6,
             hungarian=False,
             hungarian_max_classes=200,
+            align_strategy=None,
+            align_seed=0,
             fallback_steps=100,
             fallback_lr=0.1,
         )
@@ -325,26 +371,45 @@ class ETFHead(ClsHead):
         return proto
 
     def _hungarian_align(self, w_np: np.ndarray, sim_mat: np.ndarray, sim_cfg: Dict, logger) -> np.ndarray:
-        # Hungarian alignment solves a global one-to-one assignment between
-        # classes and fixed prototypes, reducing arbitrary associations that
-        # can introduce target conflict.
-        if not sim_cfg.get('hungarian', False):
+        strategy = sim_cfg.get('align_strategy', None)
+        if strategy is None:
+            strategy = 'hungarian' if sim_cfg.get('hungarian', False) else 'none'
+        strategy = str(strategy).lower()
+        if strategy in ['none', 'off', 'identity']:
             return w_np
         max_classes = int(sim_cfg.get('hungarian_max_classes', 200))
         if self.num_classes > max_classes:
-            logger.warning("SIM proto : Hungarian alignment skipped (C={} > {}).".format(
+            logger.warning("SIM proto : alignment skipped (C={} > {}).".format(
                 self.num_classes, max_classes))
-            return w_np
-        try:
-            from scipy.optimize import linear_sum_assignment
-        except Exception as exc:
-            logger.warning("SIM proto : scipy not available for Hungarian ({})".format(exc))
             return w_np
 
         # Cost matches each class row in S to a prototype row in W^T W.
         proto_sim = w_np.T @ w_np
         diff = sim_mat[:, None, :] - proto_sim[None, :, :]
         cost = np.mean(diff ** 2, axis=2)
+        if strategy == 'random':
+            rng = np.random.RandomState(int(sim_cfg.get('align_seed', 0)))
+            perm = rng.permutation(self.num_classes)
+            return w_np[:, perm]
+        if strategy == 'greedy':
+            perm = np.full(self.num_classes, -1, dtype=np.int64)
+            used = set()
+            for cls in range(self.num_classes):
+                order = np.argsort(cost[cls])
+                for idx in order:
+                    if idx not in used:
+                        perm[cls] = idx
+                        used.add(idx)
+                        break
+            if np.any(perm < 0):
+                logger.warning("SIM proto : greedy alignment incomplete, fallback to identity.")
+                return w_np
+            return w_np[:, perm]
+        try:
+            from scipy.optimize import linear_sum_assignment
+        except Exception as exc:
+            logger.warning("SIM proto : scipy not available for Hungarian ({})".format(exc))
+            return w_np
         row_ind, col_ind = linear_sum_assignment(cost)
         perm = np.zeros(self.num_classes, dtype=np.int64)
         perm[row_ind] = col_ind
